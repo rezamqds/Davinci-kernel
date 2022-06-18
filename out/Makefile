@@ -5,7 +5,7 @@ PATCHLEVEL = 14
 
 lastword = $(word $(words $(1)),$(1))
 makedir := $(dir $(call lastword,$(MAKEFILE_LIST)))
-
+#3w
 ifeq ("$(origin V)", "command line")
 VERBOSE := $(V)
 endif
