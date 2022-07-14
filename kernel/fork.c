@@ -95,6 +95,8 @@
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
 #include <linux/simple_lmk.h>
+#include <linux/devfreq_boost.h>
+#include <linux/cpu_input_boost.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -2126,6 +2128,7 @@ static __latent_entropy struct task_struct *copy_process(
 	write_unlock_irq(&tasklist_lock);
 
 	proc_fork_connector(p);
+	sched_post_fork(p);
 	cgroup_post_fork(p);
 	cgroup_threadgroup_change_end(current);
 	perf_event_fork(p);
@@ -2236,6 +2239,13 @@ long _do_fork(unsigned long clone_flags,
 	struct task_struct *p;
 	int trace = 0;
 	long nr;
+
+	/* Boost DDR bus to the max when userspace launches an app */
+	if (task_is_zygote(current)) {
+		cpu_input_boost_kick_max(5000);
+		devfreq_boost_kick_max(DEVFREQ_MSM_CPUBW,
+			CONFIG_DEVFREQ_INPUT_BOOST_DURATION_MS);
+	}
 
 	/*
 	 * Determine whether and which event to report to ptracer.  When

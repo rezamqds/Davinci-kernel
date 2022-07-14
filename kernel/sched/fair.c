@@ -119,8 +119,8 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_L
  *
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_min_granularity		= 750000ULL;
-unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
+unsigned int sysctl_sched_min_granularity		= 2500000ULL;
+unsigned int normalized_sysctl_sched_min_granularity	= 2500000ULL;
 
 /*
  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
@@ -147,10 +147,10 @@ unsigned int __read_mostly sysctl_sched_energy_aware = 1;
  *
  * (default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_wakeup_granularity		= 1000000UL;
-unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+unsigned int sysctl_sched_wakeup_granularity		= 5000000UL;
+unsigned int normalized_sysctl_sched_wakeup_granularity	= 5000000UL;
 
-const_debug unsigned int sysctl_sched_migration_cost	= 1000000UL;
+const_debug unsigned int sysctl_sched_migration_cost = 1000000UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
 #ifdef CONFIG_SCHED_WALT
@@ -2515,7 +2515,8 @@ void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 	struct numa_group *ng;
 	int priv;
 
-	if (!static_branch_likely(&sched_numa_balancing))
+	if (!IS_ENABLED(CONFIG_NUMA_BALANCING) ||
+	    !static_branch_likely(&sched_numa_balancing))
 		return;
 
 	/* for example, ksmd faulting in a user's mm */
@@ -5339,7 +5340,12 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int task_new = !(flags & ENQUEUE_WAKEUP);
 	bool prefer_idle = sched_feat(EAS_PREFER_IDLE) ?
+#ifdef CONFIG_SCHED_TUNE
 				(schedtune_prefer_idle(p) > 0) : 0;
+#elif  CONFIG_UCLAMP_TASK
+				(uclamp_latency_sensitive(p) > 0) : 0;
+#endif
+	int idle_h_nr_running = idle_policy(p->policy);
 
 #ifdef CONFIG_SCHED_WALT
 	p->misfit = !task_fits_max(p, rq->cpu);
@@ -5891,7 +5897,11 @@ cpu_is_in_target_set(struct task_struct *p, int cpu)
 	struct root_domain *rd = cpu_rq(cpu)->rd;
 	int first_cpu, next_usable_cpu;
 
-	if (schedtune_prefer_high_cap(p)) {
+#ifdef CONFIG_SCHED_TUNE
+	if (schedtune_prefer_high_cap(p) && p->prio <= DEFAULT_PRIO) {
+#elif  CONFIG_UCLAMP_TASK
+	if (uclamp_boosted(p) && p->prio <= DEFAULT_PRIO) {
+#endif
 		first_cpu = rd->mid_cap_orig_cpu != -1 ? rd->mid_cap_orig_cpu :
 			    rd->max_cap_orig_cpu;
 
@@ -6880,12 +6890,20 @@ boosted_cpu_util(int cpu, struct sched_walt_cpu_load *walt_load)
 static inline unsigned long
 boosted_task_util(struct task_struct *task)
 {
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	unsigned long util = task_util_est(task);
+	unsigned long util_min = uclamp_eff_value(task, UCLAMP_MIN);
+	unsigned long util_max = uclamp_eff_value(task, UCLAMP_MAX);
+
+	return clamp(util, util_min, util_max);
+#else
 	unsigned long util = task_util_est(task);
 	long margin = schedtune_task_margin(task);
 
 	trace_sched_boost_task(task, util, margin);
 
 	return util + margin;
+#endif
 }
 
 static unsigned long cpu_util_without(int cpu, struct task_struct *p);
@@ -7457,15 +7475,14 @@ static inline bool task_fits_max(struct task_struct *p, int cpu)
 	if (capacity == max_capacity)
 		return true;
 
-	if (is_min_capacity_cpu(cpu)) {
-		if (task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
-			task_boost > 0 ||
-			schedtune_task_boost(p) > 0)
-			return false;
-	} else { /* mid cap cpu */
-		if (task_boost > 1)
-			return false;
-	}
+	if ((task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
+#ifdef CONFIG_SCHED_TUNE
+			schedtune_task_boost(p) > 0) &&
+#elif  CONFIG_UCLAMP_TASK
+			uclamp_boosted(p) > 0) &&
+#endif
+			is_min_capacity_cpu(cpu))
+		return false;
 
 	return task_fits_capacity(p, capacity, cpu);
 }
@@ -7658,6 +7675,10 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 			if (sched_cpu_high_irqload(i))
 				continue;
 
+			/* Skip CPUs which do not fit task requirements */
+			if (capacity_of(i) < boosted_task_util(p))
+				continue;
+
 			if (fbt_env->skip_cpu == i)
 				continue;
 
@@ -7783,6 +7804,20 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 					continue;
 				}
 				if (best_idle_cpu != -1)
+					continue;
+
+				/*
+				 * Skip searching for active CPU for tasks have
+				 * high priority & prefer_high_cap.
+				 */
+				if (prefer_high_cap && p->prio <= DEFAULT_PRIO)
+					continue;
+
+				/*
+				 * Skip searching for active CPU for tasks have
+				 * high priority & prefer_high_cap.
+				 */
+				if (prefer_high_cap && p->prio <= DEFAULT_PRIO)
 					continue;
 
 				/*
@@ -8299,8 +8334,12 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 	int placement_boost = task_boost_policy(p);
 	u64 start_t = 0;
 	int next_cpu = -1, backup_cpu = -1;
-	int boosted = (schedtune_task_boost(p) > 0 || per_task_boost(p) > 0);
 	bool prefer_high_cap = schedtune_prefer_high_cap(p);
+#ifdef CONFIG_SCHED_TUNE
+	int boosted = (schedtune_task_boost(p) > 0 || per_task_boost(p) > 0);
+#elif  CONFIG_UCLAMP_TASK
+	int boosted = (uclamp_boosted(p) > 0 || per_task_boost(p) > 0);
+#endif
 	fbt_env.fastpath = 0;
 	fbt_env.need_idle = 0;
 
@@ -8370,8 +8409,11 @@ static int find_energy_efficient_cpu(struct sched_domain *sd,
 		 * all if(prefer_idle) blocks.
 		 */
 		prefer_idle = sched_feat(EAS_PREFER_IDLE) ?
+#ifdef CONFIG_SCHED_TUNE
 				(schedtune_prefer_idle(p) > 0) : 0;
-
+#elif  CONFIG_UCLAMP_TASK
+				(uclamp_latency_sensitive(p) > 0) : 0;
+#endif
 		eenv->max_cpu_count = EAS_CPU_BKP + 1;
 
 		fbt_env.rtg_target = rtg_target;
@@ -8489,7 +8531,12 @@ static inline int wake_energy(struct task_struct *p, int prev_cpu,
 		 * Force prefer-idle tasks into the slow path, this may not happen
 		 * if none of the sd flags matched.
 		 */
-		if (schedtune_prefer_idle(p) > 0 && !sync)
+#ifdef CONFIG_SCHED_TUNE
+		if (schedtune_prefer_idle(p) > 0
+#elif  CONFIG_UCLAMP_TASK
+		if (uclamp_latency_sensitive(p) > 0
+#endif
+				&& !sync)
 			return false;
 	}
 	return true;
@@ -8543,7 +8590,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 
 	for_each_domain(cpu, tmp) {
 		if (!(tmp->flags & SD_LOAD_BALANCE))
-			break;
+			continue;
 
 		/*
 		 * If both cpu and prev_cpu are part of this domain,
@@ -9432,17 +9479,17 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
 
 	p->on_rq = TASK_ON_RQ_MIGRATING;
 	deactivate_task(env->src_rq, p, DEQUEUE_NOCLOCK);
-	lockdep_off();
 #ifdef CONFIG_SCHED_WALT
+	lockdep_off();
 	double_lock_balance(env->src_rq, env->dst_rq);
 	if (!(env->src_rq->clock_update_flags & RQCF_UPDATED))
 		update_rq_clock(env->src_rq);
 	set_task_cpu(p, env->dst_cpu);
 	double_unlock_balance(env->src_rq, env->dst_rq);
+	lockdep_on();
 #else
 	set_task_cpu(p, env->dst_cpu);
 #endif
-	lockdep_on();
 }
 
 /*
@@ -10185,9 +10232,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 
 		sgs->group_load += load;
 		sgs->group_util += cpu_util(i);
-		sgs->sum_nr_running += rq->cfs.h_nr_running;
 
 		nr_running = rq->nr_running;
+		sgs->sum_nr_running += nr_running;
+
 		if (nr_running > 1)
 			*overload = true;
 
@@ -11468,6 +11516,15 @@ get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 
 	/* scale ms to jiffies */
 	interval = msecs_to_jiffies(interval);
+
+	/*
+	 * Reduce likelihood of busy balancing at higher domains racing with
+	 * balancing at lower domains by preventing their balancing periods
+	 * from being multiples of each other.
+	 */
+	if (cpu_busy)
+		interval -= 1;
+
 	interval = clamp(interval, 1UL, max_load_balance_interval);
 
 	/*
@@ -12371,7 +12428,8 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		entity_tick(cfs_rq, se, queued);
 	}
 
-	if (static_branch_unlikely(&sched_numa_balancing))
+	if (IS_ENABLED(CONFIG_NUMA_BALANCING) &&
+	    static_branch_unlikely(&sched_numa_balancing))
 		task_tick_numa(rq, curr);
 
 	update_misfit_status(curr, rq);
@@ -12651,8 +12709,6 @@ void free_fair_sched_group(struct task_group *tg)
 {
 	int i;
 
-	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
-
 	for_each_possible_cpu(i) {
 		if (tg->cfs_rq)
 			kfree(tg->cfs_rq[i]);
@@ -12728,6 +12784,8 @@ void unregister_fair_sched_group(struct task_group *tg)
 	unsigned long flags;
 	struct rq *rq;
 	int cpu;
+
+ 	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
 
 	for_each_possible_cpu(cpu) {
 		if (tg->se[cpu])
@@ -12892,6 +12950,10 @@ const struct sched_class fair_sched_class = {
 
 #ifdef CONFIG_SCHED_WALT
 	.fixup_walt_sched_stats	= walt_fixup_sched_stats_fair,
+#endif
+
+#ifdef CONFIG_UCLAMP_TASK
+	.uclamp_enabled		= 1,
 #endif
 };
 

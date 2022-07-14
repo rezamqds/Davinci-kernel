@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <trace/events/power.h>
 #include <linux/sched/sysctl.h>
+#include <linux/binfmts.h>
 #include "sched.h"
 
 #define SUGOV_KTHREAD_PRIORITY	50
@@ -240,6 +241,10 @@ static void sugov_get_util(unsigned long *util, unsigned long *max, int cpu,
 		rt = (rt * max_cap) >> SCHED_CAPACITY_SHIFT;
 		*util = min(*util + rt, max_cap);
 	}
+
+#ifdef CONFIG_UCLAMP_TASK
+   	*util = uclamp_util_with(rq, *util, NULL);
+#endif	
 }
 
 static void sugov_set_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
@@ -527,6 +532,10 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set,
 	struct sugov_policy *sg_policy;
 	unsigned int rate_limit_us;
 
+	/* Apply init protection, else values will get overwritten */
+	if (task_is_booster(current))
+		return count;
+
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
 
@@ -546,6 +555,10 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
 	struct sugov_policy *sg_policy;
 	unsigned int rate_limit_us;
+
+	/* Apply init protection, else values will get overwritten */
+	if (task_is_booster(current))
+		return count;
 
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
@@ -736,6 +749,20 @@ static int sugov_init(struct cpufreq_policy *policy)
 				cpufreq_policy_transition_delay_us(policy);
 	tunables->down_rate_limit_us =
 				cpufreq_policy_transition_delay_us(policy);
+
+	if (cpumask_test_cpu(policy->cpu, cpu_perf_mask)) {
+		tunables->up_rate_limit_us =
+					CONFIG_SCHEDUTIL_UP_RATE_LIMIT_BIG;
+		tunables->down_rate_limit_us =
+					CONFIG_SCHEDUTIL_DOWN_RATE_LIMIT_BIG;
+	}
+
+	if (cpumask_test_cpu(policy->cpu, cpu_lp_mask)) {
+		tunables->up_rate_limit_us =
+					CONFIG_SCHEDUTIL_UP_RATE_LIMIT_LITTLE;
+		tunables->down_rate_limit_us =
+					CONFIG_SCHEDUTIL_DOWN_RATE_LIMIT_LITTLE;
+	}
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
